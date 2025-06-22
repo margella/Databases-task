@@ -1,0 +1,74 @@
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    role TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE users_audit (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER,
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    changed_by TEXT,
+    field_changed TEXT,
+    old_value TEXT,
+    new_value TEXT
+);
+
+-- Функция для логирования изменений
+CREATE OR REPLACE FUNCTION log_user_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.name IS DISTINCT FROM NEW.name THEN
+        INSERT INTO users_audit(user_id, changed_at, changed_by, field_changed, old_value, new_value)
+        VALUES (OLD.id, NOW(), CURRENT_USER, 'name', OLD.name, NEW.name);
+    END IF;
+    
+    IF OLD.email IS DISTINCT FROM NEW.email THEN
+        INSERT INTO users_audit(user_id, changed_at, changed_by, field_changed, old_value, new_value)
+        VALUES (OLD.id, NOW(), CURRENT_USER, 'email', OLD.email, NEW.email);
+    END IF;
+    
+    IF OLD.role IS DISTINCT FROM NEW.role THEN
+        INSERT INTO users_audit(user_id, changed_at, changed_by, field_changed, old_value, new_value)
+        VALUES (OLD.id, NOW(), CURRENT_USER, 'role', OLD.role, NEW.role);
+    END IF;
+    
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql;
+
+-- Создание триггера
+CREATE TRIGGER trigger_log_user_update
+    BEFORE UPDATE ON users
+    FOR EACH ROW
+    EXECUTE FUNCTION log_user_update();
+
+-- Вставка тестовых данных
+INSERT INTO users (name, email, role)
+VALUES
+    ('Ivan Ivanov', 'ivan@example.com', 'developer'),
+    ('Anna Petrova', 'anna@example.com', 'analyst');
+
+-- Обновление для создания записи аудита
+UPDATE users
+SET role = 'manager'
+WHERE name = 'Anna Petrova';
+
+-- Функция экспорта аудита
+CREATE OR REPLACE FUNCTION log_user_export()
+RETURNS VOID AS $$
+BEGIN
+    EXECUTE FORMAT('
+        COPY (
+            SELECT * FROM users_audit
+            WHERE changed_at::date = CURRENT_DATE - 1
+        ) TO ''/tmp/users_audit_export_%s.csv'' WITH CSV HEADER',
+        TO_CHAR(CURRENT_DATE - 1, 'YYYY-MM-DD')
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Настройка cron задания
+SELECT cron.schedule('daily-users-audit', '0 3 * * *', 'SELECT log_user_export();');
