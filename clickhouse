@@ -1,0 +1,134 @@
+--Таблица сырых данных 
+CREATE TABLE default.users_events_raw
+(
+    user_id UInt32,
+    event_type String,
+    points_spent UInt32,
+    event_time DateTime
+)
+ENGINE = MergeTree
+ORDER BY (event_type,
+ user_id)
+TTL event_time + toIntervalDay(30)
+
+--Таблица агрегированных данных
+
+CREATE TABLE default.users_events_agg
+(
+
+    event_date Date,
+    event_type String,
+    uniq_users_state AggregateFunction(uniq,
+ UInt32),
+    point_spent_state AggregateFunction(sum,
+ UInt32),
+    action_count_state AggregateFunction(count,
+ UInt32)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (event_date,
+ event_type)
+TTL event_date + toIntervalDay(180)
+
+--Материализованное вью
+CREATE MATERIALIZED VIEW default.mv_users_events TO default.users_events_agg
+(
+
+    event_date Date,
+    event_type String,
+    uniq_users_state AggregateFunction(uniq,
+ UInt32),
+    point_spent_state AggregateFunction(sum,
+ UInt32),
+    action_count_state AggregateFunction(count)
+)
+AS SELECT
+    toDate(event_time) AS event_date,
+    event_type,
+    uniqState(user_id) AS uniq_users_state,
+    sumState(points_spent) AS point_spent_state,
+
+    countState() AS action_count_state
+FROM default.users_events_raw
+GROUP BY
+    event_date;
+    
+   
+ --Подсчет ретенции пользователей
+WITH 
+-- Шаг 1: Определяем когорты пользователей 
+cohorts AS (
+    SELECT
+        user_id,
+        min(toDate(event_time)) as cohort_date
+    FROM users_events_raw
+    GROUP BY user_id
+),
+
+-- Шаг 2: Получаем агрегированные данные по дням
+daily_stats AS (
+    SELECT 
+        event_date,
+        uniqMerge(uniq_users_state) as unique_users_day,
+        sumMerge(point_spent_state) as total_spent_day,
+        countMerge(action_count_state) as total_actions_day
+    FROM users_events_agg
+    GROUP BY event_date
+),
+
+-- Шаг 3: Определяем активность пользователей по дням
+user_daily_activity AS (
+    SELECT DISTINCT
+        user_id,
+        toDate(event_time) as activity_date
+    FROM users_events_raw
+),
+
+-- Шаг 4: Соединяем когорты с активностью для расчета retention
+cohort_retention AS (
+    SELECT 
+        c.cohort_date,
+        c.user_id,
+        uniqState(c.user_id) as cohort_users_state,
+        uniqIfState(c.user_id, 
+            EXISTS(
+                SELECT 1 FROM user_daily_activity uda 
+                WHERE uda.user_id = c.user_id 
+                AND uda.activity_date BETWEEN c.cohort_date + 1 AND c.cohort_date + 7
+            )
+        ) as returned_users_state,
+        countState() as cohort_records_state
+    FROM cohorts c
+    GROUP BY c.cohort_date, c.user_id
+)
+
+-- Финальный запрос
+SELECT 
+    cohort_date,
+    -- Merge функция 1: общее количество пользователей в когорте (день 0)
+    uniqMerge(cohort_users_state) as total_users_day_0,
+    -- Merge функция 2: количество пользователей, вернувшихся в течение 7 дней
+    uniqMerge(returned_users_state) as returned_in_7_days,
+    -- Merge функция 3: общее количество записей когорты (для контроля)
+    countMerge(cohort_records_state) as total_cohort_records,
+    -- Расчет Retention: процент вернувшихся пользователей
+    round(uniqMerge(returned_users_state) * 100.0 / uniqMerge(cohort_users_state), 2) as retention_7d_percent,
+    -- Дополнительно: средние траты когорты (используем существующие данные)
+    round(
+        (SELECT sumMerge(point_spent_state) FROM users_events_agg WHERE event_date = cohort_date) 
+        / uniqMerge(cohort_users_state), 2
+    ) as avg_day0_spending
+FROM cohort_retention
+GROUP BY cohort_date
+ORDER BY cohort_date;
+
+--Запрос с группировками
+SELECT 
+    event_date,
+    event_type,
+    uniqMerge(uniq_users_state) as unique_users,
+    sumMerge(point_spent_state) as total_spent,
+    countMerge(action_count_state) as total_actions
+FROM users_events_agg
+GROUP BY event_date, event_type
+ORDER BY event_date, event_type;
